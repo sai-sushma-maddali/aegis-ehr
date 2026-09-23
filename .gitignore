@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+venv/
+.venv/
+clinical_chroma_db/
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+.next/
+*.log
