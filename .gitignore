@@ -13,3 +13,6 @@ dist/
 build/
 .next/
 *.log
+
+# macOS
+.DS_Store
