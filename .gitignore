@@ -8,8 +8,11 @@ venv/
 clinical_chroma_db/
 backend/data/chroma_ehr_db/
 backend/data/chroma_threat_db/
+backend/data/chroma_aegis_db/
 backend/data/raw/
 qwen_medical_guard_merged/
+tests/test_results.json
+
 
 
 # Node / Frontend

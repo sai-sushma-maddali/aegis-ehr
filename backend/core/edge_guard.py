@@ -44,12 +44,25 @@ DEFAULT_MERGED_MODEL_PATH = "./qwen_medical_guard_merged"
 
 LABEL_SAFE = 0
 LABEL_PROMPT_INJECTION = 1
-ID2LABEL = {0: "SAFE", 1: "PROMPT_INJECTION"}
-LABEL2ID = {"SAFE": 0, "PROMPT_INJECTION": 1}
+# Spec labels (BENIGN_CLINICAL / ADVERSARIAL_ATTACK) map onto the same ids.
+ID2LABEL = {
+    0: "SAFE",
+    1: "PROMPT_INJECTION",
+    # Aliases used by the hackathon brief:
+    # 0 = BENIGN_CLINICAL, 1 = ADVERSARIAL_ATTACK
+}
+LABEL2ID = {
+    "SAFE": 0,
+    "PROMPT_INJECTION": 1,
+    "BENIGN_CLINICAL": 0,
+    "ADVERSARIAL_ATTACK": 1,
+}
 
+# Cosine distance <= 0.18  <=>  cosine similarity >= 0.82
 DEFAULT_VECTOR_SIMILARITY_THRESHOLD = 0.82
-DEFAULT_ALLOW_THRESHOLD = 0.10
-DEFAULT_BLOCK_THRESHOLD = 0.90
+DEFAULT_VECTOR_DISTANCE_THRESHOLD = 0.18
+DEFAULT_ALLOW_THRESHOLD = 0.15
+DEFAULT_BLOCK_THRESHOLD = 0.85
 DEFAULT_THREAT_COLLECTION = "threat_signatures"
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -683,6 +696,15 @@ class EdgeGuard:
             triage_extras=triage_extras,
         )
 
+    # Spec aliases ---------------------------------------------------------
+    def _classify_intent_local(self, prompt: str) -> ClassifierResult:
+        """Alias for the local Qwen binary classifier forward pass."""
+        return self._classify(prompt)
+
+    def _scrub_phi(self, text: str) -> RedactionResult:
+        """Alias for PHI redaction prior to cloud escalation."""
+        return self.redactor.redact(text)
+
     def hot_patch_vector_db(
         self,
         signature: str,
@@ -802,7 +824,9 @@ class EdgeGuard:
 
         distance = float(results["distances"][0][0])
         similarity = 1.0 - distance
-        if similarity < self.vector_similarity_threshold:
+        # Spec: block when cosine distance <= 0.18 (similarity >= 0.82).
+        distance_threshold = 1.0 - self.vector_similarity_threshold
+        if distance > distance_threshold:
             return None
 
         metadata = results["metadatas"][0][0] or {}
@@ -1067,9 +1091,9 @@ class EdgeGuard:
     def _threat_from_probability(attack_probability: float) -> str:
         if attack_probability >= 0.98:
             return "CRITICAL"
-        if attack_probability >= 0.95:
+        if attack_probability >= 0.92:
             return "HIGH"
-        if attack_probability >= 0.90:
+        if attack_probability >= 0.85:
             return "MEDIUM"
         return "LOW"
 

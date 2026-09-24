@@ -40,7 +40,7 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 RAW_DATA_FOLDER = BACKEND_DIR / "data" / "raw"
 CHROMA_PATH = BACKEND_DIR / "data" / "chroma_ehr_db"
-COLLECTION_NAME = "clinical_ehr"
+COLLECTION_NAME = "clinical_records"
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "mistral:7b"
@@ -1244,6 +1244,10 @@ IMPORTANT:
         evidence_top_k: int = 3,
     ) -> dict[str, Any]:
         return self.ask(question, evidence_top_k=evidence_top_k)
+
+
+# Spec alias used by the FastAPI gateway / hackathon brief.
+ClinicalAgent = ClinicalAssistant
 
 
 # ---------------------------------------------------------------------------
