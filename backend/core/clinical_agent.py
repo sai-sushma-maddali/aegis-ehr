@@ -4,7 +4,7 @@ Clinical RAG Assistant for Aegis EHR.
 Knowledge base : serag-ai/Synthetic-EHR-Llama
 Embeddings     : sentence-transformers/all-MiniLM-L6-v2
 Vector store   : ChromaDB
-LLM            : Mistral-7B-Instruct-v0.3 via local Ollama
+LLM            : mistralai/Mistral-7B-Instruct-v0.3 via local zrt
 
 Chunking strategy
 -----------------
@@ -42,8 +42,8 @@ RAW_DATA_FOLDER = BACKEND_DIR / "data" / "raw"
 CHROMA_PATH = BACKEND_DIR / "data" / "chroma_ehr_db"
 COLLECTION_NAME = "clinical_records"
 
-OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "mistral:7b"
+OLLAMA_BASE_URL = "http://127.0.0.1:8080/v1"
+OLLAMA_MODEL = "hf:mistralai/Mistral-7B-Instruct-v0.3@main"
 
 # MiniLM max = 256 tokens. Keep clinical body under 180 so there is room for
 # Patient ID / Patient Name / Section headers in the embedded text.
@@ -379,7 +379,8 @@ def build_rag_context(retrieved_chunks: list[dict[str, Any]]) -> str:
 
     for chunk in retrieved_chunks:
         chunk_id = chunk["chunk_id"]
-        section_name = chunk["metadata"]["section"]
+        metadata = chunk.get("metadata") or {}
+        section_name = metadata.get("section") or "Record"
         text = chunk["text"].strip()
 
         # Drop identity/section prefixes already present as structured headers.
@@ -446,6 +447,123 @@ def validate_response_integrity(
         "invalid_ids": sorted(invalid_ids),
         "allowed_ids": sorted(allowed_ids),
     }
+
+
+_SMALL_TALK = re.compile(
+    r"""
+    ^(?:
+        (?:hi|hello|hey|hiya|yo|howdy)
+        (?:\s+there)?
+      | good\s+(?:morning|afternoon|evening|day)
+      | (?:thanks|thank\s+you|thx)
+        (?:\s+(?:so\s+much|a\s+lot))?
+      | (?:bye|goodbye|see\s+you)
+      | how\s+are\s+you
+      | what(?:'s|\s+is)\s+up
+      | who\s+are\s+you
+      | what\s+can\s+you\s+do
+      | what\s+do\s+you\s+do
+      | help
+      | (?:ok|okay|sure|got\s+it|cool|great)
+    )$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _normalize_chat_text(text: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9'\s]", " ", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def small_talk_reply(text: str) -> str | None:
+    """Reply to a greeting without opening a chart. None means search."""
+    cleaned = _normalize_chat_text(text)
+    if not cleaned or len(cleaned) > 48 or not _SMALL_TALK.match(cleaned):
+        return None
+    lowered = cleaned.lower()
+    if re.match(r"^(thanks|thank you|thx)\b", lowered):
+        return (
+            "You're welcome. Ask about a medicine, an allergy, "
+            "a diagnosis, or someone in the charts."
+        )
+    if re.match(r"^(bye|goodbye|see you)\b", lowered):
+        return "Goodbye."
+    if re.match(r"^(who are you|what can you do|what do you do|help)$", lowered):
+        return (
+            "I look through these synthetic charts. "
+            "Ask about a medicine, an allergy, a diagnosis, or a person in the records."
+        )
+    if re.match(r"^(how are you|what's up|what is up)$", lowered):
+        return (
+            "I'm here. Ask about a medicine, an allergy, "
+            "a diagnosis, or someone in the charts."
+        )
+    if re.match(r"^(ok|okay|sure|got it|cool|great)$", lowered):
+        return "Okay. Ask if you want something else from the charts."
+    return (
+        "Hi. I can look through the synthetic charts. "
+        "Ask about a medicine, an allergy, a diagnosis, or someone in the records."
+    )
+
+
+def find_patients_mentioned(
+    text: str,
+    patient_registry: dict[str, str],
+) -> list[dict[str, str]]:
+    """Find charts named in free text. An empty list means none were named."""
+    if not text or not patient_registry:
+        return []
+
+    text_lower = text.lower()
+    found: dict[str, str] = {}
+
+    for mrn in re.findall(
+        r"\b(?:MRN|Medical\s+Record\s+Number)\s*[:#-]?\s*(L\d+)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        mrn_id = mrn.upper()
+        if mrn_id in patient_registry:
+            found[mrn_id] = patient_registry[mrn_id]
+
+    for patient_id, patient_name in patient_registry.items():
+        if re.search(
+            rf"(?<!\w){re.escape(patient_id)}(?!\d)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            found[patient_id] = patient_name
+        if re.search(
+            rf"(?<!\w){re.escape(patient_name.lower())}(?!\w)",
+            text_lower,
+        ):
+            found[patient_id] = patient_name
+
+    if found:
+        return [
+            {"patient_id": patient_id, "patient_name": patient_name}
+            for patient_id, patient_name in found.items()
+        ]
+
+    partial: list[tuple[str, str]] = []
+    for patient_id, patient_name in patient_registry.items():
+        parts = [part for part in patient_name.split() if len(part) >= 3]
+        if any(
+            re.search(
+                rf"(?<!\w){re.escape(part.lower())}(?!\w)",
+                text_lower,
+            )
+            for part in parts
+        ):
+            partial.append((patient_id, patient_name))
+
+    if 1 <= len(partial) <= 3:
+        return [
+            {"patient_id": patient_id, "patient_name": patient_name}
+            for patient_id, patient_name in partial
+        ]
+    return []
 
 
 def resolve_patient_from_question(
@@ -563,6 +681,7 @@ class ClinicalAssistant:
         raw_data_folder: str | Path = RAW_DATA_FOLDER,
         reset_collection: bool = False,
         load_embedding_model: bool = True,
+        embedding_model: Any | None = None,
     ) -> None:
         self.chroma_path = Path(chroma_path)
         self.collection_name = collection_name
@@ -600,7 +719,10 @@ class ClinicalAssistant:
                 metadata={"hnsw:space": "cosine"},
             )
 
-        if load_embedding_model:
+        if embedding_model is not None:
+            self.embedding_model = embedding_model
+            self.chunker = ClinicalChunker(tokenizer=embedding_model.tokenizer)
+        elif load_embedding_model:
             self._load_embedding_model()
 
         self.refresh_registry()
@@ -617,13 +739,13 @@ class ClinicalAssistant:
 
     def check_ollama(self) -> list[str]:
         response = requests.get(
-            f"{self.ollama_base_url}/api/tags",
+            f"{self.ollama_base_url}/models",
             timeout=5,
         )
         response.raise_for_status()
         models = [
-            model["name"]
-            for model in response.json().get("models", [])
+            model["id"]
+            for model in response.json().get("data", [])
         ]
         return models
 
@@ -632,24 +754,33 @@ class ClinicalAssistant:
         prompt: str,
         timeout: int = 120,
     ) -> str:
-        """Send a prompt to local Mistral-7B-Instruct-v0.3 through Ollama."""
-        url = f"{self.ollama_base_url}/api/generate"
+        """Send a prompt to local Mistral-7B-Instruct-v0.3 through zrt."""
+        url = f"{self.ollama_base_url}/chat/completions"
         payload = {
             "model": self.ollama_model,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
             "stream": False,
-            "options": {"temperature": 0.0},
         }
+        started = time.perf_counter()
         try:
             response = requests.post(url, json=payload, timeout=timeout)
             response.raise_for_status()
-            return response.json()["response"].strip()
+            body = response.json()
+            content = body["choices"][0]["message"]["content"].strip()
+            usage = body.get("usage") or {}
+            self.last_usage = {
+                "input_tokens": usage.get("prompt_tokens"),
+                "output_tokens": usage.get("completion_tokens"),
+                "generation_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
+            return content
         except Exception as error:
             raise RuntimeError(
                 "Local Mistral generation failed. "
-                "Make sure Ollama is running and "
-                f"{self.ollama_model!r} is installed "
-                f"(e.g. `ollama pull {self.ollama_model}`)."
+                "Make sure zrt is serving "
+                f"{self.ollama_model!r} "
+                "(e.g. `zrt serve hf:mistralai/Mistral-7B-Instruct-v0.3@main`)."
             ) from error
 
     # ----- knowledge-base ingestion -----
@@ -934,6 +1065,119 @@ class ClinicalAssistant:
         )
         return ranked[:top_k]
 
+    def retrieve_global(
+        self,
+        question: str,
+        top_k: int = 6,
+    ) -> list[dict[str, Any]]:
+        """Search every indexed chart, not only one named patient."""
+        if self.embedding_model is None:
+            raise RuntimeError("Embedding model is not loaded.")
+        total_chunks = self.collection.count()
+        if total_chunks == 0:
+            return []
+
+        query_embedding = self.embedding_model.encode(
+            question,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        ).tolist()
+        results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(top_k, total_chunks),
+            include=["documents", "metadatas", "distances"],
+        )
+        retrieved: list[dict[str, Any]] = []
+        for chunk_id, document, metadata, distance in zip(
+            results["ids"][0],
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            retrieved.append(
+                {
+                    "chunk_id": chunk_id,
+                    "text": document,
+                    "metadata": metadata or {},
+                    "distance": float(distance),
+                    "similarity": 1.0 - float(distance),
+                }
+            )
+        return retrieved
+
+    def retrieve_for_chat(
+        self,
+        question: str,
+        patients: list[dict[str, str]],
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        if not patients:
+            return self.retrieve_global(question, top_k=top_k)
+        if len(patients) == 1:
+            return self.hybrid_retrieve(
+                question=question,
+                patient_id=patients[0]["patient_id"],
+                top_k=top_k,
+            )
+
+        per_patient = max(2, top_k // len(patients))
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for patient in patients[:3]:
+            for chunk in self.hybrid_retrieve(
+                question=question,
+                patient_id=patient["patient_id"],
+                top_k=per_patient,
+            ):
+                chunk_id = chunk["chunk_id"]
+                if chunk_id in seen:
+                    continue
+                seen.add(chunk_id)
+                merged.append(chunk)
+        return merged[:top_k]
+
+    def answer_chat(
+        self,
+        question: str,
+        retrieved_chunks: list[dict[str, Any]],
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
+        """Answer in plain language, using only the retrieved chart text."""
+        if not retrieved_chunks:
+            return (
+                "I couldn't find a passage in the charts that answers that. "
+                "Try asking about a medicine, allergy, diagnosis, or someone in the records."
+            )
+
+        history_lines: list[str] = []
+        for turn in (history or [])[-6:]:
+            text = str(turn.get("text") or "").strip()
+            if not text:
+                continue
+            speaker = "Clinician" if turn.get("role") == "user" else "Assistant"
+            history_lines.append(f"{speaker}: {text[:500]}")
+        history_block = "\n".join(history_lines) or "(none)"
+
+        prompt = f"""
+You are a clinical assistant in a conversation about synthetic EHR charts.
+
+Answer the clinician's latest question in normal sentences.
+Use only the chart excerpts below. Do not invent medicines, doses, diagnoses, or dates.
+If several patients appear, say which person each fact belongs to.
+If the excerpts do not contain the answer, say so plainly.
+Do not ask the clinician to rewrite the question or to use a special format.
+
+Recent conversation:
+{history_block}
+
+Latest question:
+{question}
+
+Chart excerpts:
+{build_rag_context(retrieved_chunks)}
+""".strip()
+        return self.generate_with_mistral(prompt).strip()
+
     def retrieve_subquestion_evidence(
         self,
         subquestion: str,
@@ -1178,63 +1422,99 @@ IMPORTANT:
     def ask(
         self,
         question: str,
-        evidence_top_k: int = 3,
+        evidence_top_k: int = 5,
+        history: list[dict[str, str]] | None = None,
+        patient_hint: str | None = None,
     ) -> dict[str, Any]:
         """
-        Full clinical RAG pipeline.
+        Conversational clinical RAG.
 
-        Patient resolution → question decomposition → patient-filtered
-        hybrid retrieval → grounded answer per sub-question → verify.
+        A named person narrows the search to that chart. Otherwise the
+        question is searched across the records. Prior turns are used only
+        to keep follow-ups on the same person.
         """
         start_time = time.perf_counter()
+        self.last_usage = None
+        greeting = small_talk_reply(question)
+        if greeting:
+            return {
+                "patient_id": None,
+                "patient_name": None,
+                "original_question": question,
+                "subquestions": [question],
+                "subanswers": [
+                    {
+                        "question": question,
+                        "answer": greeting,
+                        "retrieved_chunks": [],
+                        "fallback_used": False,
+                    }
+                ],
+                "answer": greeting,
+                "mode": "chat",
+                "latency_seconds": time.perf_counter() - start_time,
+                "generation_usage": self.last_usage,
+            }
 
-        patient = resolve_patient_from_question(
-            question, self.patient_registry
+        prior = [
+            {
+                "role": str(turn.get("role") or "user"),
+                "text": str(turn.get("text") or ""),
+            }
+            for turn in (history or [])
+            if str(turn.get("text") or "").strip()
+        ]
+
+        patients = find_patients_mentioned(question, self.patient_registry)
+        if not patients and patient_hint:
+            patients = find_patients_mentioned(
+                patient_hint, self.patient_registry
+            )
+        if not patients and prior:
+            patients = find_patients_mentioned(
+                "\n".join(turn["text"] for turn in prior),
+                self.patient_registry,
+            )
+
+        retrieved_chunks = self.retrieve_for_chat(
+            question,
+            patients,
+            top_k=evidence_top_k,
         )
-        patient_id = patient["patient_id"]
-        patient_name = patient["patient_name"]
-
-        subquestions = self.decompose_question(question)
-        if not subquestions:
-            subquestions = [question]
-        if len(subquestions) > 6:
-            subquestions = [question]
-
-        subanswers: list[dict[str, Any]] = []
-        for subquestion in subquestions:
-            retrieved_chunks = self.retrieve_subquestion_evidence(
-                subquestion=subquestion,
-                patient_id=patient_id,
-                patient_name=patient_name,
-                top_k=evidence_top_k,
-            )
-            result = self.answer_subquestion(
-                subquestion=subquestion,
-                retrieved_chunks=retrieved_chunks,
-            )
-            subanswers.append(
-                {
-                    "question": subquestion,
-                    "answer": result["answer"],
-                    "retrieved_chunks": retrieved_chunks,
-                    "integrity_validation": result["integrity_validation"],
-                    "coverage_validation": result["coverage_validation"],
-                    "fallback_used": result.get("fallback_used", False),
-                }
-            )
-
-        final_answer = "\n\n".join(
-            item["answer"] for item in subanswers
+        answer = self.answer_chat(
+            question,
+            retrieved_chunks,
+            history=prior,
         )
+
+        if len(patients) == 1:
+            patient_id = patients[0]["patient_id"]
+            patient_name = patients[0]["patient_name"]
+        elif patients:
+            patient_id = None
+            patient_name = ", ".join(
+                patient["patient_name"] for patient in patients
+            )
+        else:
+            patient_id = None
+            patient_name = None
 
         return {
             "patient_id": patient_id,
             "patient_name": patient_name,
             "original_question": question,
-            "subquestions": subquestions,
-            "subanswers": subanswers,
-            "answer": final_answer,
+            "subquestions": [question],
+            "subanswers": [
+                {
+                    "question": question,
+                    "answer": answer,
+                    "retrieved_chunks": retrieved_chunks,
+                    "fallback_used": False,
+                }
+            ],
+            "answer": answer,
             "latency_seconds": time.perf_counter() - start_time,
+            "generation_usage": self.last_usage,
         }
 
     # Backwards-compatible alias matching the notebook API.

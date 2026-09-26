@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -488,7 +489,24 @@ class CloudDefender:
 # Parsing / normalization helpers
 # ---------------------------------------------------------------------------
 
+def _load_project_env() -> None:
+    """Load repo-root ``.env`` without overriding variables already set."""
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def _resolve_api_key() -> str | None:
+    _load_project_env()
     return (
         os.getenv("GEMINI_API_KEY")
         or os.getenv("GOOGLE_API_KEY")

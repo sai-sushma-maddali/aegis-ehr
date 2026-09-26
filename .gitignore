@@ -10,6 +10,9 @@ backend/data/chroma_ehr_db/
 backend/data/chroma_threat_db/
 backend/data/chroma_aegis_db/
 backend/data/raw/
+backend/data/weight_cache.pid
+backend/data/weight_cache.lock
+backend/data/prompt_activity.json
 qwen_medical_guard_merged/
 tests/test_results.json
 

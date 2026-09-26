@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 # Constants / evaluation metadata (from fine-tuning results)
 # ---------------------------------------------------------------------------
 
-BASE_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+BASE_MODEL_ID = "/opt/hp/zrt/models/hf/Qwen/Qwen2.5-7B-Instruct/main"
 PEFT_ADAPTER_ID = "SushmaMaddali/qwen-medical-prompt-guard-lora"
-DEFAULT_MERGED_MODEL_PATH = "./qwen_medical_guard_merged"
+DEFAULT_MERGED_MODEL_PATH = "/home/hp6/jupyterlab/qwen_medical_guard_merged"
 
 LABEL_SAFE = 0
 LABEL_PROMPT_INJECTION = 1
@@ -324,6 +324,7 @@ class EdgeGuard:
             classifier_model is not None and classifier_tokenizer is not None
         )
         self._classifier_load_error: str | None = None
+        self._remote_classifier = False
 
         self._embedding_model_name = embedding_model_name
         self._embedding_model = embedding_model
@@ -440,6 +441,7 @@ class EdgeGuard:
             tokenizer = AutoTokenizer.from_pretrained(
                 str(merged),
                 trust_remote_code=True,
+                local_files_only=True,
             )
             model = AutoModelForSequenceClassification.from_pretrained(
                 str(merged),
@@ -448,6 +450,7 @@ class EdgeGuard:
                 label2id=LABEL2ID,
                 torch_dtype=dtype,
                 trust_remote_code=True,
+                local_files_only=True,
             )
         else:
             logger.info(
@@ -462,6 +465,7 @@ class EdgeGuard:
             tokenizer = AutoTokenizer.from_pretrained(
                 self.base_model_id,
                 trust_remote_code=True,
+                local_files_only=True,
             )
             model = AutoModelForSequenceClassification.from_pretrained(
                 self.base_model_id,
@@ -470,8 +474,13 @@ class EdgeGuard:
                 label2id=LABEL2ID,
                 torch_dtype=dtype,
                 trust_remote_code=True,
+                local_files_only=True,
             )
-            model = PeftModel.from_pretrained(model, self.peft_adapter_id)
+            model = PeftModel.from_pretrained(
+                model,
+                self.peft_adapter_id,
+                local_files_only=True,
+            )
 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -618,7 +627,9 @@ class EdgeGuard:
             "attack_probability": clf.attack_probability,
             "predicted_label": clf.predicted_label,
             "classifier_latency_ms": clf.latency_ms,
-            "model_eval_metrics": MODEL_EVAL_METRICS,
+            "vector_cache_latency_ms": getattr(
+                self, "_last_vector_latency_ms", None
+            ),
         }
 
         if clf.attack_probability <= self.allow_threshold:
@@ -637,6 +648,12 @@ class EdgeGuard:
             )
 
         if clf.attack_probability >= self.block_threshold:
+            threat_level = self._threat_from_probability(clf.attack_probability)
+            signature_id, stored_signature = self._patch_edge_attack(
+                validated,
+                threat_level=threat_level,
+                request_id=request_id,
+            )
             return self._build_response(
                 request_id=request_id,
                 timestamp=timestamp,
@@ -648,15 +665,13 @@ class EdgeGuard:
                 attack_details={
                     # Binary classifier cannot assign taxonomy.
                     "attack_class": "UNKNOWN",
-                    "threat_level": self._threat_from_probability(
-                        clf.attack_probability
-                    ),
-                    "signature_id": "",
+                    "threat_level": threat_level,
+                    "signature_id": signature_id,
                     "extracted_intent": (
                         "Local Qwen classifier flagged PROMPT_INJECTION "
                         f"(p_attack={clf.attack_probability:.4f})."
                     ),
-                    "hot_patch_signature": None,
+                    "hot_patch_signature": stored_signature,
                 },
                 privacy_audit=self._empty_privacy_audit(),
                 ui_badge=UI_BADGES["BLOCKED_TRIAGE"],
@@ -705,15 +720,63 @@ class EdgeGuard:
         """Alias for PHI redaction prior to cloud escalation."""
         return self.redactor.redact(text)
 
+    def _patch_edge_attack(
+        self,
+        prompt: str,
+        threat_level: str,
+        request_id: str,
+    ) -> tuple[str, str | None]:
+        """
+        Store a high-confidence local attack so the next similar prompt
+        is blocked by the vector cache. Patient identifiers are scrubbed
+        before the text is written. A patch failure still leaves the
+        current request blocked.
+        """
+        try:
+            redaction = self.redactor.redact(prompt)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "edge_guard.edge_patch_redaction_failed",
+                extra={"request_id": request_id},
+            )
+            return "", None
+        if not redaction.success:
+            logger.warning(
+                "edge_guard.edge_patch_skipped",
+                extra={"request_id": request_id, "reason": "redaction_failed"},
+            )
+            return "", None
+        signature = (redaction.scrubbed_text or "").strip()
+        if not signature:
+            return "", None
+        try:
+            signature_id = self.hot_patch_vector_db(
+                signature=signature,
+                attack_class="UNKNOWN",
+                threat_level=threat_level,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "edge_guard.edge_patch_failed",
+                extra={"request_id": request_id},
+            )
+            return "", None
+        return signature_id, signature
+
     def hot_patch_vector_db(
         self,
         signature: str,
         attack_class: str,
         threat_level: str,
+        match_text: str | None = None,
     ) -> str:
         """
         Persist a validated attack signature into the local threat cache.
         Returns the stored signature ID. Deduplicates near-identical text.
+
+        ``match_text`` is the string future prompts are compared with.
+        It defaults to ``signature``. Pass the original prompt when
+        ``signature`` is a PHI-scrubbed copy, so an identical replay hits.
         """
         if not isinstance(signature, str) or not signature.strip():
             raise ValueError("signature must be a non-empty string.")
@@ -733,7 +796,10 @@ class EdgeGuard:
             )
 
         clean_signature = signature.strip()
-        signature_id = self._signature_id(clean_signature)
+        match_source = (match_text or clean_signature).strip()
+        if not match_source:
+            raise ValueError("match_text must be a non-empty string.")
+        signature_id = self._signature_id(match_source)
 
         # Exact-ID dedupe
         existing = self.threat_collection.get(ids=[signature_id])
@@ -745,8 +811,7 @@ class EdgeGuard:
             return signature_id
 
         # Near-duplicate by embedding similarity
-        embedding_model = self._ensure_embedding_model()
-        embedding = self._embed_texts([clean_signature])
+        embedding = self._embed_texts([match_source])
 
         try:
             if self.threat_collection.count() > 0:
@@ -807,39 +872,61 @@ class EdgeGuard:
         signatures stored in the threat collection can match.
         """
         started = time.perf_counter()
-        if self.threat_collection.count() == 0:
-            return None
+        try:
+            if self.threat_collection.count() == 0:
+                return None
 
-        query_embedding = self._embed_texts([prompt])
+            query_embedding = self._embed_texts([prompt])
 
-        results = self.threat_collection.query(
-            query_embeddings=query_embedding,
-            n_results=1,
-            include=["documents", "metadatas", "distances"],
-        )
-        latency_ms = self._elapsed_ms(started)
+            results = self.threat_collection.query(
+                query_embeddings=query_embedding,
+                n_results=1,
+                include=["documents", "metadatas", "distances"],
+            )
+            latency_ms = self._elapsed_ms(started)
 
-        if not results["ids"] or not results["ids"][0]:
-            return None
+            if not results["ids"] or not results["ids"][0]:
+                return None
 
-        distance = float(results["distances"][0][0])
-        similarity = 1.0 - distance
-        # Spec: block when cosine distance <= 0.18 (similarity >= 0.82).
-        distance_threshold = 1.0 - self.vector_similarity_threshold
-        if distance > distance_threshold:
-            return None
+            distance = float(results["distances"][0][0])
+            similarity = 1.0 - distance
+            # Spec: block when cosine distance <= 0.18 (similarity >= 0.82).
+            distance_threshold = 1.0 - self.vector_similarity_threshold
+            if distance > distance_threshold:
+                return None
 
-        metadata = results["metadatas"][0][0] or {}
-        return {
-            "signature_id": results["ids"][0][0],
-            "similarity": similarity,
-            "distance": distance,
-            "latency_ms": latency_ms,
-            "attack_class": metadata.get("attack_class", "UNKNOWN"),
-            "threat_level": metadata.get("threat_level", "HIGH"),
-        }
+            metadata = results["metadatas"][0][0] or {}
+            return {
+                "signature_id": results["ids"][0][0],
+                "similarity": similarity,
+                "distance": distance,
+                "latency_ms": latency_ms,
+                "attack_class": metadata.get("attack_class", "UNKNOWN"),
+                "threat_level": metadata.get("threat_level", "HIGH"),
+            }
+        finally:
+            self._last_vector_latency_ms = self._elapsed_ms(started)
+
+    def attach_remote_classifier(self) -> None:
+        """Use the resident weight cache instead of loading Qwen in this process."""
+        self._remote_classifier = True
+        self._classifier_ready = True
+        self._model = True
+        self._classifier_load_error = None
 
     def _classify(self, prompt: str) -> ClassifierResult:
+        if self._remote_classifier:
+            from .weight_cache import classify_text
+
+            started = time.perf_counter()
+            result = classify_text(prompt, self.max_length)
+            return ClassifierResult(
+                safe_probability=float(result["safe_probability"]),
+                attack_probability=float(result["attack_probability"]),
+                predicted_label=str(result["predicted_label"]),
+                latency_ms=self._elapsed_ms(started),
+            )
+
         if not self._classifier_ready or self._model is None:
             detail = self._classifier_load_error or "classifier not loaded"
             raise RuntimeError(f"Qwen classifier unavailable: {detail}")
@@ -891,6 +978,8 @@ class EdgeGuard:
         privacy_audit = {
             "phi_redacted": redaction.phi_redacted,
             "cloud_escalated": False,
+            "phi_exposed": False,
+            "cloud_payload_bytes": 0,
             "scrubbed_entities": list(redaction.scrubbed_entities),
         }
 
@@ -921,8 +1010,14 @@ class EdgeGuard:
                 extras=triage_extras,
             )
 
+        outbound = redaction.scrubbed_text or ""
+        privacy_audit["cloud_payload_bytes"] = len(outbound.encode("utf-8"))
+        residual_phi = bool(self.redactor.redact(outbound).phi_redacted)
+
         try:
-            raw = self.cloud_defender.analyze(redaction.scrubbed_text)
+            cloud_started = time.perf_counter()
+            raw = self.cloud_defender.analyze(outbound)
+            triage_extras["cloud_latency_ms"] = self._elapsed_ms(cloud_started)
             cloud = normalize_cloud_result(raw)
         except (CloudDefenderUnavailable, CloudDefenderError, TimeoutError) as exc:
             logger.warning(
@@ -957,16 +1052,21 @@ class EdgeGuard:
             )
 
         privacy_audit["cloud_escalated"] = True
+        privacy_audit["phi_exposed"] = residual_phi
         signature_id = ""
         hot_patch_signature = cloud.get("hot_patch_signature")
 
         if cloud["is_attack"]:
-            if hot_patch_signature:
+            # Store the prompt that was reviewed so an identical replay
+            # matches the vector cache. The cloud phrase is stored too
+            # when it differs, so related wording can match later.
+            if outbound.strip():
                 try:
                     signature_id = self.hot_patch_vector_db(
-                        signature=hot_patch_signature,
+                        signature=outbound.strip(),
                         attack_class=cloud["attack_class"],
                         threat_level=cloud["threat_level"],
+                        match_text=prompt,
                     )
                 except ValueError as exc:
                     logger.warning(
@@ -977,6 +1077,23 @@ class EdgeGuard:
                         },
                     )
                     signature_id = ""
+            if hot_patch_signature and hot_patch_signature.strip() != outbound.strip():
+                try:
+                    phrase_id = self.hot_patch_vector_db(
+                        signature=hot_patch_signature,
+                        attack_class=cloud["attack_class"],
+                        threat_level=cloud["threat_level"],
+                    )
+                    if not signature_id:
+                        signature_id = phrase_id
+                except ValueError as exc:
+                    logger.warning(
+                        "edge_guard.hot_patch_rejected",
+                        extra={
+                            "request_id": request_id,
+                            "reason": str(exc),
+                        },
+                    )
 
             return self._build_response(
                 request_id=request_id,
@@ -1102,6 +1219,8 @@ class EdgeGuard:
         return {
             "phi_redacted": False,
             "cloud_escalated": False,
+            "phi_exposed": False,
+            "cloud_payload_bytes": 0,
             "scrubbed_entities": [],
         }
 
