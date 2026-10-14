@@ -23,6 +23,8 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from .config import get_settings
+
 logger = logging.getLogger("aegis.weight_cache")
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -30,8 +32,6 @@ DATA_DIR = BACKEND_DIR / "data"
 PID_PATH = DATA_DIR / "weight_cache.pid"
 LOG_PATH = DATA_DIR / "weight_cache.log"
 LOCK_PATH = DATA_DIR / "weight_cache.lock"
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_PORT = 8091
 
 _LOCK = threading.Lock()
 _STATE: dict[str, Any] = {
@@ -46,16 +46,24 @@ _TOKENIZER: Any = None
 _GUARD: Any = None
 
 
+def _embedding_model_name() -> str:
+    return get_settings().embedding_model
+
+
+# Kept for callers that read the module attribute.
+EMBEDDING_MODEL_NAME = _embedding_model_name()
+DEFAULT_PORT = get_settings().weight_cache_port
+
+
 def cache_port() -> int:
-    raw = os.getenv("AEGIS_WEIGHT_CACHE_PORT", str(DEFAULT_PORT))
-    return int(raw)
+    return get_settings().weight_cache_port
 
 
 def cache_url() -> str:
-    return os.getenv(
-        "AEGIS_WEIGHT_CACHE_URL",
-        f"http://127.0.0.1:{cache_port()}",
-    ).rstrip("/")
+    override = os.getenv("AEGIS_WEIGHT_CACHE_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    return get_settings().weight_cache_url.rstrip("/")
 
 
 def _read_pid() -> int | None:
@@ -438,7 +446,8 @@ def serve(model_path: str) -> None:
     )
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()))
-    server = ThreadingHTTPServer(("127.0.0.1", cache_port()), _Handler)
+    host = get_settings().weight_cache_host
+    server = ThreadingHTTPServer((host, cache_port()), _Handler)
     threading.Thread(
         target=_load_all,
         args=(model_path,),

@@ -1,4 +1,4 @@
-"""Session telemetry for the HP ZGX Nano dashboard.
+"""Session telemetry for the Aegis defense dashboard.
 
 One tracker records each screened request. Latency, token counts, and GPU
 memory come from the call that just finished. Dollar rates are the local
@@ -11,7 +11,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-# GB10 unified memory specification used by the dashboard formula.
+# Fallback when live /proc or nvidia-smi memory is unavailable.
 VRAM_TOTAL_GB = 128.0
 
 # Avoided cloud token price for on-device routes.

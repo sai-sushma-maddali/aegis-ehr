@@ -187,6 +187,14 @@ export default function MetricsDashboard({
   const tiers = telemetry?.tiers || [];
   const attackRows = telemetry?.attack_rows || [];
   const hotPatches = telemetry?.hot_patches || [];
+  const platform = telemetry?.platform || {};
+  const hardware = telemetry?.hardware || {};
+  const platformName = platform.display_name || "Aegis host";
+  const memoryLabel = platform.memory_label || "System memory";
+  const archBlurb =
+    platform.architecture_blurb ||
+    hardware.gpu_name ||
+    "On-device compute";
 
   const cards = [
     {
@@ -255,7 +263,7 @@ export default function MetricsDashboard({
     <section className="md-shell">
       <div className="md-header">
         <div>
-          <p className="md-kicker">HP ZGX Nano</p>
+          <p className="md-kicker">{platformName}</p>
           <h2 className="md-title">Aegis defense telemetry</h2>
         </div>
         <div className="md-header-actions">
@@ -324,13 +332,13 @@ export default function MetricsDashboard({
         </article>
 
         <article className="md-panel">
-          <h3 className="md-panel-title">HP ZGX Nano telemetry</h3>
+          <h3 className="md-panel-title">{platformName} telemetry</h3>
           <dl className="md-telemetry">
             <div>
               <div className="md-tele-row">
                 <dt>
                   <Cpu size={16} />
-                  Unified memory (128 GB LPDDR5x)
+                  {memoryLabel}
                 </dt>
                 <dd>
                   {engine?.system_memory_used_gb == null
@@ -390,8 +398,13 @@ export default function MetricsDashboard({
                   ? "Not readable"
                   : `${engine?.system_cpu_percent == null ? "—" : `${Number(engine.system_cpu_percent).toFixed(1)}% CPU`} • ${engine?.system_gpu_percent == null ? "—" : `${Number(engine.system_gpu_percent).toFixed(0)}% GPU`}`}
                 <span>
-                  NVIDIA GB10 Grace Blackwell (20-core Arm, 1,000 TOPS FP4 rating
-                  {engine?.package_temp_c == null ? "" : `, ${Number(engine.package_temp_c).toFixed(0)}°C package`})
+                  {archBlurb}
+                  {hardware.rated_tops_fp4 == null
+                    ? ""
+                    : ` · ${hardware.rated_tops_fp4} TOPS FP4 rating`}
+                  {engine?.package_temp_c == null
+                    ? ""
+                    : ` · ${Number(engine.package_temp_c).toFixed(0)}°C package`}
                 </span>
               </dd>
             </div>

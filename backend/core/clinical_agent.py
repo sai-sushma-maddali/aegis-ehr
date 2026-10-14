@@ -28,22 +28,25 @@ from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from .config import get_settings
+
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (defaults from aegis.config.json)
 # ---------------------------------------------------------------------------
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
 
-REPO_ID = "serag-ai/Synthetic-EHR-Llama"
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+_cfg = get_settings()
+REPO_ID = _cfg.ehr_repo_id
+EMBEDDING_MODEL_NAME = _cfg.embedding_model
 
-RAW_DATA_FOLDER = BACKEND_DIR / "data" / "raw"
-CHROMA_PATH = BACKEND_DIR / "data" / "chroma_ehr_db"
+RAW_DATA_FOLDER = _cfg.raw_data_dir
+CHROMA_PATH = _cfg.chroma_dir
 COLLECTION_NAME = "clinical_records"
 
-OLLAMA_BASE_URL = "http://127.0.0.1:8080/v1"
-OLLAMA_MODEL = "hf:mistralai/Mistral-7B-Instruct-v0.3@main"
+OLLAMA_BASE_URL = _cfg.clinical_llm_base_url
+OLLAMA_MODEL = _cfg.clinical_llm_model
 
 # MiniLM max = 256 tokens. Keep clinical body under 180 so there is room for
 # Patient ID / Patient Name / Section headers in the embedded text.

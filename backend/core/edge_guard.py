@@ -31,16 +31,14 @@ from .cloud_defender import (
     CloudDefenderUnavailable,
     normalize_cloud_result,
 )
+from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants / evaluation metadata (from fine-tuning results)
+# Paths and thresholds come from aegis.config.json via get_settings().
 # ---------------------------------------------------------------------------
-
-BASE_MODEL_ID = "/opt/hp/zrt/models/hf/Qwen/Qwen2.5-7B-Instruct/main"
-PEFT_ADAPTER_ID = "SushmaMaddali/qwen-medical-prompt-guard-lora"
-DEFAULT_MERGED_MODEL_PATH = "/home/hp6/jupyterlab/qwen_medical_guard_merged"
 
 LABEL_SAFE = 0
 LABEL_PROMPT_INJECTION = 1
@@ -58,13 +56,50 @@ LABEL2ID = {
     "ADVERSARIAL_ATTACK": 1,
 }
 
-# Cosine distance <= 0.18  <=>  cosine similarity >= 0.82
-DEFAULT_VECTOR_SIMILARITY_THRESHOLD = 0.82
-DEFAULT_VECTOR_DISTANCE_THRESHOLD = 0.18
-DEFAULT_ALLOW_THRESHOLD = 0.15
-DEFAULT_BLOCK_THRESHOLD = 0.85
 DEFAULT_THREAT_COLLECTION = "threat_signatures"
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def _cfg_guard_path() -> str:
+    path = get_settings().guard_merged_model
+    return str(path) if path else ""
+
+
+def _cfg_base_model() -> str:
+    path = get_settings().qwen_base_model
+    return str(path) if path else ""
+
+
+def _cfg_peft_adapter() -> str:
+    return get_settings().peft_adapter_id
+
+
+def _cfg_embedding_model() -> str:
+    return get_settings().embedding_model
+
+
+def _cfg_vector_similarity() -> float:
+    return get_settings().vector_similarity
+
+
+def _cfg_allow() -> float:
+    return get_settings().allow_threshold
+
+
+def _cfg_block() -> float:
+    return get_settings().block_threshold
+
+
+# Backward-compatible names (resolved at import from config).
+BASE_MODEL_ID = _cfg_base_model()
+PEFT_ADAPTER_ID = _cfg_peft_adapter()
+DEFAULT_MERGED_MODEL_PATH = _cfg_guard_path()
+DEFAULT_VECTOR_SIMILARITY_THRESHOLD = _cfg_vector_similarity()
+DEFAULT_VECTOR_DISTANCE_THRESHOLD = max(
+    0.0, 1.0 - DEFAULT_VECTOR_SIMILARITY_THRESHOLD
+)
+DEFAULT_ALLOW_THRESHOLD = _cfg_allow()
+DEFAULT_BLOCK_THRESHOLD = _cfg_block()
+DEFAULT_EMBEDDING_MODEL = _cfg_embedding_model()
 
 # Published evaluation numbers — informational only; not used for gating.
 MODEL_EVAL_METRICS = {
@@ -77,8 +112,7 @@ MODEL_EVAL_METRICS = {
     "notes": (
         "Binary classifier missed 5 attacks on the original test set. "
         "Do not treat local triage as perfect. "
-        "GPU-only median latency on HP ZGX Nano was ~61–63 ms "
-        "(p95 ~63–65 ms)."
+        "Published GPU-only median latency was ~61–63 ms (p95 ~63–65 ms)."
     ),
 }
 
@@ -530,9 +564,15 @@ class EdgeGuard:
         try:
             vector_hit = self._check_vector_cache(validated)
         except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "edge_guard.vector_cache_error",
+            # Fail-closed path: log without a full traceback by default so
+            # intentional unit-test mocks (and transient Chroma blips) do not
+            # look like unhandled crashes. Set AEGIS_LOG_LEVEL=DEBUG for stacks.
+            logger.warning(
+                "edge_guard.vector_cache_error: %s: %s",
+                type(exc).__name__,
+                exc,
                 extra={"request_id": request_id},
+                exc_info=logger.isEnabledFor(logging.DEBUG),
             )
             if self.fail_closed_on_vector_error:
                 return self._build_response(
@@ -593,9 +633,12 @@ class EdgeGuard:
         try:
             clf = self._classify(validated)
         except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "edge_guard.classifier_error",
+            logger.warning(
+                "edge_guard.classifier_error: %s: %s",
+                type(exc).__name__,
+                exc,
                 extra={"request_id": request_id},
+                exc_info=logger.isEnabledFor(logging.DEBUG),
             )
             if self.fail_closed_on_classifier_error:
                 return self._build_response(

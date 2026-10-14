@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
+from core.config import get_settings
 from core.document_extract import compose_prompt_with_document, extract_document_text
 from core.zrt_metrics import collect_engine_telemetry
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,10 +40,17 @@ logger = logging.getLogger("aegis.gateway")
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BACKEND_DIR.parent
 TEST_RESULTS_PATH = PROJECT_DIR / "tests" / "test_results.json"
-DEFAULT_CHROMA_PATH = BACKEND_DIR / "data" / "chroma_aegis_db"
 ACTIVITY_PATH = BACKEND_DIR / "data" / "prompt_activity.json"
 MAX_ACTIVITY = 500
 _ACTIVITY_LOCK = threading.Lock()
+
+
+def _settings():
+    return get_settings()
+
+
+def _chroma_path() -> Path:
+    return _settings().chroma_dir
 
 
 def _load_activity() -> list[dict[str, Any]]:
@@ -120,7 +128,7 @@ class HealthResponse(BaseModel):
 
 class AppState:
     def __init__(self) -> None:
-        self.offline_mode = _env_flag("AEGIS_OFFLINE_MODE", default=True)
+        self.offline_mode = _settings().offline_mode
         self.edge_guard: Any | None = None
         self.clinical_agent: Any | None = None
         self.ingestion: Any | None = None
@@ -205,8 +213,9 @@ def _build_offline_edge_guard(
             "recommended_action": "ALLOW",
         }
 
+    cfg = _settings()
     client = chroma_client or chromadb.PersistentClient(
-        path=str(DEFAULT_CHROMA_PATH)
+        path=str(cfg.chroma_dir)
     )
     guard = EdgeGuard(
         chroma_client=client,
@@ -216,9 +225,9 @@ def _build_offline_edge_guard(
         embedding_model=embedding_model,  # must match seeded MiniLM dims
         classifier_model=object(),
         classifier_tokenizer=object(),
-        allow_threshold=0.15,
-        block_threshold=0.85,
-        vector_similarity_threshold=0.82,
+        allow_threshold=cfg.allow_threshold,
+        block_threshold=cfg.block_threshold,
+        vector_similarity_threshold=cfg.vector_similarity,
     )
     guard._classify = KeywordClassifier()  # type: ignore[method-assign]
     guard._classifier_ready = True
@@ -227,9 +236,9 @@ def _build_offline_edge_guard(
 
 def _prepare_weight_cache(guard_model_path: str) -> Any | None:
     """Start or reuse the resident model cache. None means load in-process."""
-    if STATE.offline_mode or not _env_flag("AEGIS_WEIGHT_CACHE", default=True):
+    if STATE.offline_mode or not _settings().weight_cache:
         return None
-    if not Path(guard_model_path).exists():
+    if not guard_model_path or not Path(guard_model_path).exists():
         return None
     from core.weight_cache import (
         RemoteEmbedder,
@@ -251,17 +260,13 @@ def _prepare_weight_cache(guard_model_path: str) -> Any | None:
 
 def _init_stack() -> None:
     from core.clinical_agent import ClinicalAgent
-    from core.edge_guard import DEFAULT_MERGED_MODEL_PATH, EdgeGuard
+    from core.edge_guard import EdgeGuard
     from core.ingestion import EHRIngestion
 
-    chroma_path = Path(
-        os.getenv("AEGIS_CHROMA_PATH", str(DEFAULT_CHROMA_PATH))
-    )
-    reset = _env_flag("AEGIS_RESET_ON_BOOT", default=False)
-    guard_model_path = os.getenv(
-        "AEGIS_GUARD_MODEL_PATH",
-        DEFAULT_MERGED_MODEL_PATH,
-    )
+    cfg = _settings()
+    chroma_path = cfg.chroma_dir
+    reset = cfg.reset_on_boot
+    guard_model_path = str(cfg.guard_merged_model) if cfg.guard_merged_model else ""
     remote_embedder = _prepare_weight_cache(guard_model_path)
 
     try:
@@ -303,7 +308,7 @@ def _init_stack() -> None:
             if STATE.ingestion is not None
             else None
         )
-        if STATE.offline_mode or not Path(guard_model_path).exists():
+        if STATE.offline_mode or not guard_model_path or not Path(guard_model_path).exists():
             client = (
                 STATE.ingestion.client if STATE.ingestion is not None else None
             )
@@ -320,9 +325,12 @@ def _init_stack() -> None:
                 ),
                 chroma_path=chroma_path,
                 collection_name="threat_signatures",
-                allow_threshold=0.15,
-                block_threshold=0.85,
+                allow_threshold=cfg.allow_threshold,
+                block_threshold=cfg.block_threshold,
+                vector_similarity_threshold=cfg.vector_similarity,
                 embedding_model=embed_model,
+                embedding_model_name=cfg.embedding_model,
+                base_model_id=str(cfg.qwen_base_model) if cfg.qwen_base_model else "",
                 load_classifier=remote_embedder is None,
             )
             if remote_embedder is not None:
@@ -346,7 +354,7 @@ def _init_stack() -> None:
         STATE.edge_guard_ready = True
         STATE.offline_mode = True
 
-    if _env_flag("AEGIS_SKIP_CLINICAL", default=False):
+    if cfg.skip_clinical:
         logger.info("gateway.clinical_skipped")
         return
 
@@ -359,6 +367,9 @@ def _init_stack() -> None:
             collection_name="clinical_records",
             load_embedding_model=remote_embedder is None,
             embedding_model=remote_embedder,
+            embedding_model_name=cfg.embedding_model,
+            ollama_base_url=cfg.clinical_llm_base_url,
+            ollama_model=cfg.clinical_llm_model,
             reset_collection=False,
         )
         # If ingestion already filled clinical_records on shared client,
@@ -889,7 +900,7 @@ def _smi_number(token: str) -> float | None:
 
 
 def _unified_memory() -> dict[str, Any] | None:
-    """GB10 reports framebuffer memory as N/A; the pool is system memory."""
+    """Some ZGX GPUs report framebuffer as N/A; the pool is system memory."""
     try:
         fields: dict[str, int] = {}
         for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
@@ -936,10 +947,9 @@ def _weight_bytes() -> dict[str, int | None]:
     if STATE.edge_guard is not None and getattr(STATE.edge_guard, "model_path", None):
         guard_path = Path(STATE.edge_guard.model_path)
     guard = _tree_bytes(guard_path) if guard_path is not None else None
-    mistral = _tree_bytes(
-        Path("/opt/hp/zrt/models/hf/mistralai/Mistral-7B-Instruct-v0.3")
-    )
-    chroma = _tree_bytes(DEFAULT_CHROMA_PATH)
+    mistral_dir = _settings().mistral_model_dir
+    mistral = _tree_bytes(mistral_dir) if mistral_dir is not None else None
+    chroma = _tree_bytes(_chroma_path())
     parts = [value for value in (guard, mistral, chroma) if value is not None]
     _WEIGHT_BYTES = {
         "guard": guard,
@@ -951,7 +961,8 @@ def _weight_bytes() -> dict[str, int | None]:
 
 
 def _hardware_profile() -> dict[str, Any]:
-    """Live GB10 sensors plus on-disk weight sizes. Rated TOPS is the chip spec."""
+    """Live GPU sensors plus on-disk weight sizes when paths are configured."""
+    cfg = _settings()
     name = None
     temp = None
     util = None
@@ -979,10 +990,10 @@ def _hardware_profile() -> dict[str, Any]:
         disk_total = None
     weights = _weight_bytes()
     return {
-        "gpu_name": name or "NVIDIA GB10",
+        "gpu_name": name or cfg.gpu_fallback_name,
         "package_temp_c": temp,
         "utilization_pct": util,
-        "rated_tops_fp4": 1000,
+        "rated_tops_fp4": cfg.rated_tops_fp4,
         "disk_total_bytes": disk_total,
         "weights_bytes": weights.get("total"),
         "weights_guard_bytes": weights.get("guard"),
@@ -1250,6 +1261,7 @@ def _build_telemetry(events: list[dict[str, Any]]) -> dict[str, Any]:
         ],
         "vector_replays": vector_replays,
         "hardware": _hardware_profile(),
+        "platform": _settings().platform_public(),
         "engine": collect_engine_telemetry(),
     }
 
@@ -1281,24 +1293,21 @@ async def lifespan(_app: FastAPI):
     logger.info("gateway.shutdown")
 
 
+_boot_cfg = _settings()
 app = FastAPI(
     title="Aegis EHR Gateway",
     version="1.0.0",
-    description="Edge-first clinical AI security gateway for HP ZGX Nano",
+    description=(
+        f"Edge-first clinical AI security gateway "
+        f"({_boot_cfg.platform_display_name})"
+    ),
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        o.strip()
-        for o in os.getenv(
-            "AEGIS_CORS_ORIGINS",
-            "http://localhost:5173,http://127.0.0.1:5173,"
-            "http://localhost:3000,http://127.0.0.1:3000",
-        ).split(",")
-        if o.strip()
-    ] or ["*"],
+    allow_origins=list(_boot_cfg.cors_origins) or ["*"],
+    allow_origin_regex=_boot_cfg.cors_origin_regex or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1764,15 +1773,10 @@ async def fail_closed_handler(_request: Request, exc: Exception) -> JSONResponse
 if __name__ == "__main__":
     import uvicorn
 
-    if "AEGIS_OFFLINE_MODE" not in os.environ:
-        os.environ["AEGIS_OFFLINE_MODE"] = "1"
-    if "AEGIS_SKIP_CLINICAL" not in os.environ:
-        # Faster local boot; set to 0 when zrt is serving Mistral.
-        os.environ["AEGIS_SKIP_CLINICAL"] = "1"
-
+    run_cfg = _settings()
     uvicorn.run(
         "main:app",
-        host=os.getenv("AEGIS_HOST", "0.0.0.0"),
-        port=int(os.getenv("AEGIS_PORT", "8000")),
+        host=run_cfg.api_host,
+        port=run_cfg.api_port,
         reload=_env_flag("AEGIS_RELOAD", default=False),
     )

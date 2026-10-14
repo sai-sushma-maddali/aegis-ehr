@@ -1,4 +1,4 @@
-"""Live HP ZGX readings and the local ZRT / vLLM session histogram."""
+"""Live host readings and the local ZRT / vLLM session histogram."""
 
 from __future__ import annotations
 
@@ -8,9 +8,16 @@ import threading
 import time
 from pathlib import Path
 
-ZRT_METRICS_SOCK = Path(
-    "/opt/hp/zrt/run/vllm-hf-mistralai-mistral-7b-instruct-v0-3-main.sock"
-)
+from .config import get_settings
+
+
+def _metrics_sock() -> Path | None:
+    return get_settings().zrt_metrics_socket
+
+
+# Resolved at import for backward-compatible attribute access.
+_sock = _metrics_sock()
+ZRT_METRICS_SOCK = _sock if _sock is not None else Path("")
 
 _BUCKET = re.compile(
     r'^vllm:(time_to_first_token_seconds|e2e_request_latency_seconds)_bucket\{[^}]*\ble="([^"]+)"[^}]*\} ([0-9eE+.\-]+)'
@@ -238,7 +245,8 @@ def _gpu_sample() -> dict[str, float | None]:
 
 
 def _read_metrics_text() -> str:
-    if not ZRT_METRICS_SOCK.exists():
+    sock = _metrics_sock()
+    if sock is None or not sock.exists():
         return ""
     try:
         return subprocess.check_output(
@@ -248,7 +256,7 @@ def _read_metrics_text() -> str:
                 "--max-time",
                 "2",
                 "--unix-socket",
-                str(ZRT_METRICS_SOCK),
+                str(sock),
                 "http://localhost/metrics",
             ],
             text=True,

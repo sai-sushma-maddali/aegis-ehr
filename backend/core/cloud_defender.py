@@ -29,14 +29,17 @@ from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from .config import get_settings
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Model identifiers
+# Model identifiers (from aegis.config.json)
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "gemma-4-31b-it"
-FALLBACK_MODEL = "gemma-4-26b-a4b-it"
+_cfg = get_settings()
+DEFAULT_MODEL = _cfg.cloud_defender_model
+FALLBACK_MODEL = _cfg.cloud_defender_fallback
 DEFAULT_MODEL_CANDIDATES: tuple[str, ...] = (DEFAULT_MODEL, FALLBACK_MODEL)
 
 VALID_ATTACK_CLASSES = frozenset(
