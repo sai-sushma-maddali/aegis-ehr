@@ -112,13 +112,44 @@ cd ~/Documents   # or wherever you keep the project
 cd aegis-ehr
 ```
 
-### 1. Edit `aegis.config.json`
+### 1. Edit paths in `aegis.config.json` (repo root on Fury)
 
-Set `paths.guard_merged_model` (and optional zrt paths) for this machine. Set:
+**This is the only place to set machine-specific paths.**  
+File: `aegis-ehr/aegis.config.json` (copy from `aegis.config.example.json` if needed).
+
+Open that file and update the `"paths"` block with **absolute paths on Fury**, for example:
+
+```json
+"paths": {
+  "guard_merged_model": "/home/YOUR_USER/models/qwen_medical_guard_merged",
+  "qwen_base_model": "/opt/hp/zrt/models/hf/Qwen/Qwen2.5-7B-Instruct/main",
+  "mistral_model_dir": "/opt/hp/zrt/models/hf/mistralai/Mistral-7B-Instruct-v0.3",
+  "zrt_metrics_socket": "/opt/hp/zrt/run/vllm-hf-mistralai-mistral-7b-instruct-v0-3-main.sock",
+  "chroma_dir": "backend/data/chroma_aegis_db",
+  "raw_data_dir": "backend/data/raw",
+  "ehr_records_file": "backend/data/ehr_records.txt",
+  "seed_threats_file": "backend/data/seed_threats.json"
+}
+```
+
+| Field | Required? | What to put |
+|-------|-----------|-------------|
+| `guard_merged_model` | **Yes** for real Tier 2 | Folder with the fine-tuned Qwen guard merge |
+| `qwen_base_model` | Optional | Local Qwen base if you use PEFT from base |
+| `mistral_model_dir` | Optional | On-disk Mistral weights (dashboard size only) |
+| `zrt_metrics_socket` | Optional | zrt/vLLM metrics UNIX socket path |
+| `chroma_dir` / `raw_data_dir` / `ehr_records_file` / `seed_threats_file` | Keep defaults unless you moved data | Relative to repo root is fine |
+
+Also set flags for a full demo:
 
 ```json
 "flags": { "offline_mode": false, "skip_clinical": false, "weight_cache": true }
 ```
+
+Keep `services.ui_host` = `0.0.0.0`, `ui_port` = `5173`, and  
+`services.clinical_llm_base_url` = `http://127.0.0.1:8080/v1` unless zrt uses another port.
+
+Do **not** hardcode these paths in Python or the frontend — only this JSON file.
 
 ### 2. Install dependencies (once)
 
