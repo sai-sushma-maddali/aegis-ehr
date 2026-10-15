@@ -234,11 +234,13 @@ def _build_offline_edge_guard(
     return guard
 
 
-def _prepare_weight_cache(guard_model_path: str) -> Any | None:
+def _prepare_weight_cache() -> Any | None:
     """Start or reuse the resident model cache. None means load in-process."""
+    from core.guard_loader import can_load_neural_guard
+
     if STATE.offline_mode or not _settings().weight_cache:
         return None
-    if not guard_model_path or not Path(guard_model_path).exists():
+    if not can_load_neural_guard():
         return None
     from core.weight_cache import (
         RemoteEmbedder,
@@ -247,7 +249,7 @@ def _prepare_weight_cache(guard_model_path: str) -> Any | None:
     )
 
     try:
-        ensure_weight_cache(guard_model_path)
+        ensure_weight_cache()
     except Exception as exc:  # noqa: BLE001
         if cache_is_alive():
             raise
@@ -261,13 +263,14 @@ def _prepare_weight_cache(guard_model_path: str) -> Any | None:
 def _init_stack() -> None:
     from core.clinical_agent import ClinicalAgent
     from core.edge_guard import EdgeGuard
+    from core.guard_loader import can_load_neural_guard
     from core.ingestion import EHRIngestion
 
     cfg = _settings()
     chroma_path = cfg.chroma_dir
     reset = cfg.reset_on_boot
-    guard_model_path = str(cfg.guard_merged_model) if cfg.guard_merged_model else ""
-    remote_embedder = _prepare_weight_cache(guard_model_path)
+    use_neural_guard = (not STATE.offline_mode) and can_load_neural_guard()
+    remote_embedder = _prepare_weight_cache() if use_neural_guard else None
 
     try:
         ingestion = EHRIngestion(
@@ -308,7 +311,7 @@ def _init_stack() -> None:
             if STATE.ingestion is not None
             else None
         )
-        if STATE.offline_mode or not guard_model_path or not Path(guard_model_path).exists():
+        if not use_neural_guard:
             client = (
                 STATE.ingestion.client if STATE.ingestion is not None else None
             )
@@ -317,9 +320,16 @@ def _init_stack() -> None:
                 embedding_model=embed_model,
             )
             STATE.offline_mode = True
+            logger.warning(
+                "gateway.edge_guard_keyword_fallback "
+                "(set paths.qwen_base_model to zrt Qwen path for LoRA guard)"
+            )
         else:
+            merged = (
+                str(cfg.guard_merged_model) if cfg.guard_merged_model else ""
+            )
             STATE.edge_guard = EdgeGuard(
-                model_path=guard_model_path,
+                model_path=merged,
                 chroma_client=(
                     STATE.ingestion.client if STATE.ingestion else None
                 ),
@@ -330,7 +340,10 @@ def _init_stack() -> None:
                 vector_similarity_threshold=cfg.vector_similarity,
                 embedding_model=embed_model,
                 embedding_model_name=cfg.embedding_model,
-                base_model_id=str(cfg.qwen_base_model) if cfg.qwen_base_model else "",
+                base_model_id=(
+                    str(cfg.qwen_base_model) if cfg.qwen_base_model else ""
+                ),
+                peft_adapter_id=cfg.peft_adapter_id,
                 load_classifier=remote_embedder is None,
             )
             if remote_embedder is not None:
@@ -943,11 +956,10 @@ def _weight_bytes() -> dict[str, int | None]:
     global _WEIGHT_BYTES
     if _WEIGHT_BYTES is not None:
         return _WEIGHT_BYTES
-    guard_path = None
-    if STATE.edge_guard is not None and getattr(STATE.edge_guard, "model_path", None):
-        guard_path = Path(STATE.edge_guard.model_path)
+    cfg = _settings()
+    guard_path = cfg.guard_merged_model or cfg.qwen_base_model
     guard = _tree_bytes(guard_path) if guard_path is not None else None
-    mistral_dir = _settings().mistral_model_dir
+    mistral_dir = cfg.mistral_model_dir
     mistral = _tree_bytes(mistral_dir) if mistral_dir is not None else None
     chroma = _tree_bytes(_chroma_path())
     parts = [value for value in (guard, mistral, chroma) if value is not None]

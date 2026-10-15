@@ -1,12 +1,13 @@
-"""Load deployment settings from ``aegis.config.json`` at the repo root.
+"""Load deployment settings for AegisEHR.
+
+User-facing config (``aegis.config.json``) is intentionally small — only
+zrt-pulled model paths. Ports, LoRA id, thresholds, flags, and CORS use
+built-in defaults below (overridable with ``AEGIS_*`` env vars if needed).
 
 Resolution order for each value:
 1. Environment variable ``AEGIS_*`` (when set)
-2. ``aegis.config.json`` (or path in ``AEGIS_CONFIG``)
-3. Portable built-in defaults (safe for laptop / missing GPU assets)
-
-Absolute paths are used as-is. Relative paths are resolved against the
-repository root (parent of ``backend/``).
+2. ``aegis.config.json`` (or path in ``AEGIS_CONFIG``) for model paths
+3. Portable built-in defaults in this module
 """
 
 from __future__ import annotations
@@ -192,30 +193,13 @@ def load_settings(project_dir: Path | None = None) -> Settings:
     root = (project_dir or PROJECT_DIR).resolve()
     raw, config_path = _load_raw(root)
 
-    chroma = _resolve_path(
-        _env_str(
-            "AEGIS_CHROMA_PATH",
-            str(_dig(raw, "paths", "chroma_dir", default="backend/data/chroma_aegis_db")),
-        ),
-        project_dir=root,
-    ) or (BACKEND_DIR / "data" / "chroma_aegis_db")
-
-    raw_dir = _resolve_path(
-        str(_dig(raw, "paths", "raw_data_dir", default="backend/data/raw")),
-        project_dir=root,
-    ) or (BACKEND_DIR / "data" / "raw")
-
-    ehr_file = _resolve_path(
-        str(
-            _dig(
-                raw,
-                "paths",
-                "ehr_records_file",
-                default="backend/data/ehr_records.txt",
-            )
-        ),
-        project_dir=root,
-    ) or (BACKEND_DIR / "data" / "ehr_records.txt")
+    # Runtime data dirs — fixed under backend/data (not user-facing config).
+    chroma = BACKEND_DIR / "data" / "chroma_aegis_db"
+    raw_dir = BACKEND_DIR / "data" / "raw"
+    ehr_file = BACKEND_DIR / "data" / "ehr_records.txt"
+    env_chroma = os.getenv("AEGIS_CHROMA_PATH", "").strip()
+    if env_chroma:
+        chroma = _resolve_path(env_chroma, project_dir=root) or chroma
 
     seed_threats = _resolve_path(
         _env_str(

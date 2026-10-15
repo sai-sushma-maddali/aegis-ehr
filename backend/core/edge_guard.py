@@ -450,81 +450,16 @@ class EdgeGuard:
 
     def _load_classifier(self) -> None:
         import torch
-        from transformers import (
-            AutoModelForSequenceClassification,
-            AutoTokenizer,
-        )
+
+        from .guard_loader import load_guard_classifier
 
         self._torch = torch
-        dtype = (
-            torch.bfloat16
-            if (
-                self.device == "cuda"
-                and torch.cuda.is_available()
-                and torch.cuda.is_bf16_supported()
-            )
-            else torch.float32
-        )
-
-        merged = Path(self.model_path)
-        if merged.exists():
-            logger.info(
-                "edge_guard.loading_merged_classifier",
-                extra={"model_path": str(merged)},
-            )
-            tokenizer = AutoTokenizer.from_pretrained(
-                str(merged),
-                trust_remote_code=True,
-                local_files_only=True,
-            )
-            model = AutoModelForSequenceClassification.from_pretrained(
-                str(merged),
-                num_labels=2,
-                id2label=ID2LABEL,
-                label2id=LABEL2ID,
-                torch_dtype=dtype,
-                trust_remote_code=True,
-                local_files_only=True,
-            )
-        else:
-            logger.info(
-                "edge_guard.loading_peft_classifier",
-                extra={
-                    "base_model": self.base_model_id,
-                    "adapter": self.peft_adapter_id,
-                },
-            )
-            from peft import PeftModel
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.base_model_id,
-                trust_remote_code=True,
-                local_files_only=True,
-            )
-            model = AutoModelForSequenceClassification.from_pretrained(
-                self.base_model_id,
-                num_labels=2,
-                id2label=ID2LABEL,
-                label2id=LABEL2ID,
-                torch_dtype=dtype,
-                trust_remote_code=True,
-                local_files_only=True,
-            )
-            model = PeftModel.from_pretrained(
-                model,
-                self.peft_adapter_id,
-                local_files_only=True,
-            )
-
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-            model.config.pad_token_id = tokenizer.pad_token_id
-
-        model.to(self.device)
-        model.eval()
-
+        # Prefer settings (zrt base + HF LoRA). Optional merged folder still works.
+        tokenizer, model, identity = load_guard_classifier(device=self.device)
+        logger.info("edge_guard.classifier_ready identity=%s", identity)
         self._tokenizer = tokenizer
         self._model = model
+        self.model_path = identity
         self._classifier_ready = True
         self._classifier_load_error = None
 

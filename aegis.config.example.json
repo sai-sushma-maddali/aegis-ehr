@@ -1,64 +1,9 @@
 {
-  "_readme": "Copy to aegis.config.json and edit for your machine (local laptop, ZGX Nano, or ZGX Fury). Paths may be absolute or relative to the repo root. Leave a path empty (\"\") if that resource is not installed — the app falls back safely (offline keyword guard, skipped metrics, etc.). Environment variables AEGIS_* still override these values when set.",
-
-  "platform": {
-    "display_name": "HP ZGX",
-    "gpu_fallback_name": "NVIDIA GPU",
-    "architecture_blurb": "On-device GPU (CPU/GPU load from nvidia-smi when available)",
-    "memory_label": "System memory",
-    "rated_tops_fp4": null
-  },
+  "_readme": "Copy to aegis.config.json. ONLY set paths to models pulled with zrt. Confirm real folders with: ls /opt/hp/zrt/models/hf/  and  ls /opt/hp/zrt/run/ . Leave a path \"\" if you have not pulled that asset yet. All other settings live in code (backend/core/config.py).",
 
   "paths": {
-    "guard_merged_model": "",
-    "qwen_base_model": "",
-    "mistral_model_dir": "",
-    "zrt_metrics_socket": "",
-    "chroma_dir": "backend/data/chroma_aegis_db",
-    "raw_data_dir": "backend/data/raw",
-    "ehr_records_file": "backend/data/ehr_records.txt",
-    "seed_threats_file": "backend/data/seed_threats.json"
-  },
-
-  "services": {
-    "api_host": "127.0.0.1",
-    "api_port": 8000,
-    "ui_host": "0.0.0.0",
-    "ui_port": 5173,
-    "clinical_llm_base_url": "http://127.0.0.1:8080/v1",
-    "clinical_llm_model": "hf:mistralai/Mistral-7B-Instruct-v0.3@main",
-    "weight_cache_host": "127.0.0.1",
-    "weight_cache_port": 8091
-  },
-
-  "models": {
-    "embedding": "sentence-transformers/all-MiniLM-L6-v2",
-    "peft_adapter_id": "SushmaMaddali/qwen-medical-prompt-guard-lora",
-    "cloud_defender": "gemma-4-31b-it",
-    "cloud_defender_fallback": "gemma-4-26b-a4b-it",
-    "ehr_repo_id": "serag-ai/Synthetic-EHR-Llama"
-  },
-
-  "thresholds": {
-    "vector_similarity": 0.82,
-    "allow": 0.15,
-    "block": 0.85
-  },
-
-  "flags": {
-    "offline_mode": false,
-    "skip_clinical": false,
-    "weight_cache": true,
-    "reset_on_boot": false
-  },
-
-  "cors": {
-    "origins": [
-      "http://localhost:5173",
-      "http://127.0.0.1:5173",
-      "http://localhost:3000",
-      "http://127.0.0.1:3000"
-    ],
-    "origin_regex": "https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?$"
+    "qwen_base_model": "/opt/hp/zrt/models/hf/Qwen/Qwen2.5-7B-Instruct/main",
+    "mistral_model_dir": "/opt/hp/zrt/models/hf/mistralai/Mistral-7B-Instruct-v0.3",
+    "zrt_metrics_socket": "/opt/hp/zrt/run/vllm-hf-mistralai-mistral-7b-instruct-v0-3-main.sock"
   }
 }

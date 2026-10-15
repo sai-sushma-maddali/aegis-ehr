@@ -8,71 +8,43 @@ AegisEHR screens every clinical question (and optional uploaded document) throug
 
 ---
 
-## Configuration (one file for every machine)
+## Configuration (only zrt model paths)
 
-All machine-specific paths, ports, and labels live in **`aegis.config.json`** at the repo root (backend + Vite both read it).
+**`aegis.config.json`** at the repo root is the only file operators edit. It has **three paths** — everything else (ports, LoRA id, thresholds, flags, CORS) is in code (`backend/core/config.py`).
 
 ```bash
-cp aegis.config.example.json aegis.config.json   # if you need a fresh copy
-# edit aegis.config.json for your host
+cp aegis.config.example.json aegis.config.json
+# edit the three paths after zrt pull
 ```
-
-| Field | Purpose |
-|-------|---------|
-| `paths.guard_merged_model` | Fine-tuned Qwen guard merge folder (empty → offline keyword guard) |
-| `paths.qwen_base_model` | Optional local Qwen base for PEFT merge |
-| `paths.mistral_model_dir` | Optional on-disk Mistral weights (dashboard size only) |
-| `paths.zrt_metrics_socket` | Optional zrt/vLLM metrics UNIX socket |
-| `paths.chroma_dir` | ChromaDB directory (relative to repo root OK) |
-| `paths.seed_threats_file` | Tier-1 seed attacks JSON (committed: `backend/data/seed_threats.json`) |
-| `services.api_*` / `ui_*` | FastAPI and Vite bind host/port |
-| `services.clinical_llm_base_url` | OpenAI-compatible LLM (default zrt on `:8080`) |
-| `services.weight_cache_*` | Resident guard embedder cache |
-| `flags.offline_mode` | `true` = no cloud Tier 3 |
-| `flags.skip_clinical` | `true` = skip Mistral RAG (faster boot) |
-| `platform.*` | Dashboard labels (works for Nano / Fury / laptop) |
-
-`AEGIS_*` environment variables still override the JSON when set. Point at another file with `AEGIS_CONFIG=/path/to/file.json`.
-
-### Example: ZGX Fury (or Nano) with local models
 
 ```json
 {
-  "platform": {
-    "display_name": "HP ZGX Fury",
-    "gpu_fallback_name": "NVIDIA GPU",
-    "architecture_blurb": "ZGX Fury on-device GPU",
-    "memory_label": "System memory",
-    "rated_tops_fp4": null
-  },
   "paths": {
-    "guard_merged_model": "/home/YOUR_USER/models/qwen_medical_guard_merged",
     "qwen_base_model": "/opt/hp/zrt/models/hf/Qwen/Qwen2.5-7B-Instruct/main",
     "mistral_model_dir": "/opt/hp/zrt/models/hf/mistralai/Mistral-7B-Instruct-v0.3",
-    "zrt_metrics_socket": "/opt/hp/zrt/run/vllm-hf-mistralai-mistral-7b-instruct-v0-3-main.sock",
-    "chroma_dir": "backend/data/chroma_aegis_db",
-    "raw_data_dir": "backend/data/raw",
-    "ehr_records_file": "backend/data/ehr_records.txt"
-  },
-  "flags": {
-    "offline_mode": false,
-    "skip_clinical": false,
-    "weight_cache": true,
-    "reset_on_boot": false
+    "zrt_metrics_socket": "/opt/hp/zrt/run/vllm-hf-mistralai-mistral-7b-instruct-v0-3-main.sock"
   }
 }
 ```
 
-Leave model/zrt paths `""` if that asset is missing — the gateway boots with safe fallbacks.
+| Field | Required? | Purpose |
+|-------|-----------|---------|
+| `qwen_base_model` | **Yes** for Tier 2 | Local Qwen2.5-7B-Instruct after `zrt pull` (used with HF LoRA in code) |
+| `mistral_model_dir` | Optional | Local Mistral folder (dashboard weight size); clinical chat uses zrt `:8080` |
+| `zrt_metrics_socket` | Optional | zrt metrics socket for dashboard TTFT |
 
-**Threat seed data:** `backend/data/seed_threats.json` ships with 8 canonical attack signatures. On API boot, ingestion embeds them into Chroma `threat_signatures`. Keep that file in git (Chroma DB folders stay gitignored).
+Leave a path `""` until that asset exists. Confirm folders with `ls /opt/hp/zrt/models/hf/` and `ls /opt/hp/zrt/run/`.
+
+**In code (do not put in JSON):** LoRA `SushmaMaddali/qwen-medical-prompt-guard-lora`, ports `8000`/`5173`, clinical URL `http://127.0.0.1:8080/v1`, seeds at `backend/data/seed_threats.json`, thresholds, CORS. Advanced overrides: `AEGIS_*` env vars.
+
+**Threat seeds:** `backend/data/seed_threats.json` is committed; Chroma is created on first API boot.
 
 ---
 
 ## Architecture
 
 ```
-Clinician UI (React / Vite — port from aegis.config.json)
+Clinician UI (React / Vite :5173)
         │  /api  (Vite proxy → FastAPI on same host)
         ▼
 FastAPI gateway (backend/main.py)
@@ -90,13 +62,7 @@ FastAPI gateway (backend/main.py)
 - Python **3.10+** (CUDA PyTorch recommended on ZGX)
 - Node.js **18+**
 - Optional: HP **zrt** (or any OpenAI-compatible server) for clinical answers
-- Optional: merged guard weights + `GEMINI_API_KEY` for full Tier 2 / Tier 3
-
-Secrets stay in a gitignored `.env` at the repo root:
-
-```bash
-GEMINI_API_KEY=your_key_here
-```
+- Optional: `export GEMINI_API_KEY=...` in the API shell for Tier 3 cloud (not loaded from `.env` automatically)
 
 ---
 
@@ -112,44 +78,26 @@ cd ~/Documents   # or wherever you keep the project
 cd aegis-ehr
 ```
 
-### 1. Edit paths in `aegis.config.json` (repo root on Fury)
+### 1. Pull models with zrt, then edit `aegis.config.json`
 
-**This is the only place to set machine-specific paths.**  
-File: `aegis-ehr/aegis.config.json` (copy from `aegis.config.example.json` if needed).
+```bash
+zrt pull 'hf:Qwen/Qwen2.5-7B-Instruct@main'
+# Mistral is pulled when you `zrt serve` it (step 3)
+```
 
-Open that file and update the `"paths"` block with **absolute paths on Fury**, for example:
+Edit **only** these three paths in `aegis.config.json` (copy from `aegis.config.example.json` if needed):
 
 ```json
-"paths": {
-  "guard_merged_model": "/home/YOUR_USER/models/qwen_medical_guard_merged",
-  "qwen_base_model": "/opt/hp/zrt/models/hf/Qwen/Qwen2.5-7B-Instruct/main",
-  "mistral_model_dir": "/opt/hp/zrt/models/hf/mistralai/Mistral-7B-Instruct-v0.3",
-  "zrt_metrics_socket": "/opt/hp/zrt/run/vllm-hf-mistralai-mistral-7b-instruct-v0-3-main.sock",
-  "chroma_dir": "backend/data/chroma_aegis_db",
-  "raw_data_dir": "backend/data/raw",
-  "ehr_records_file": "backend/data/ehr_records.txt",
-  "seed_threats_file": "backend/data/seed_threats.json"
+{
+  "paths": {
+    "qwen_base_model": "/opt/hp/zrt/models/hf/Qwen/Qwen2.5-7B-Instruct/main",
+    "mistral_model_dir": "/opt/hp/zrt/models/hf/mistralai/Mistral-7B-Instruct-v0.3",
+    "zrt_metrics_socket": "/opt/hp/zrt/run/vllm-hf-mistralai-mistral-7b-instruct-v0-3-main.sock"
+  }
 }
 ```
 
-| Field | Required? | What to put |
-|-------|-----------|-------------|
-| `guard_merged_model` | **Yes** for real Tier 2 | Folder with the fine-tuned Qwen guard merge |
-| `qwen_base_model` | Optional | Local Qwen base if you use PEFT from base |
-| `mistral_model_dir` | Optional | On-disk Mistral weights (dashboard size only) |
-| `zrt_metrics_socket` | Optional | zrt/vLLM metrics UNIX socket path |
-| `chroma_dir` / `raw_data_dir` / `ehr_records_file` / `seed_threats_file` | Keep defaults unless you moved data | Relative to repo root is fine |
-
-Also set flags for a full demo:
-
-```json
-"flags": { "offline_mode": false, "skip_clinical": false, "weight_cache": true }
-```
-
-Keep `services.ui_host` = `0.0.0.0`, `ui_port` = `5173`, and  
-`services.clinical_llm_base_url` = `http://127.0.0.1:8080/v1` unless zrt uses another port.
-
-Do **not** hardcode these paths in Python or the frontend — only this JSON file.
+Use the real folders on your Fury box (`ls` to confirm). Tier 2 = that Qwen path + the HF LoRA id baked into the code. First API boot may download the LoRA once (needs network).
 
 ### 2. Install dependencies (once)
 
@@ -172,22 +120,24 @@ Confirm (still on Fury):
 curl -s http://127.0.0.1:8080/v1/models
 ```
 
-If you use a different port, update `services.clinical_llm_base_url` in `aegis.config.json`.
+Clinical LLM URL defaults to `http://127.0.0.1:8080/v1` in code. Override with `AEGIS_CLINICAL_LLM_BASE_URL` only if zrt uses another port.
 
 ### 4. Start the FastAPI gateway on Fury
 
 ```bash
 cd backend
+# optional Tier 3:
+# export GEMINI_API_KEY=your_key_here
 python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
-
-Host/port can also come from `aegis.config.json` (`services.api_host` / `api_port`) if you run `python main.py`.
 
 Health check on Fury:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health
 ```
+
+Expect `edge_guard_ready` / `clinical_agent_ready` true when Qwen path + zrt are healthy. First boot builds Chroma (can take several minutes; may download HF LoRA / EHR once).
 
 ### 5. Start the Vite UI on Fury
 
@@ -196,15 +146,13 @@ cd frontend
 npm run dev
 ```
 
-Vite binds using `services.ui_host` / `ui_port` from `aegis.config.json` (default `0.0.0.0:5173`) and proxies `/api` → FastAPI on the same machine.
+Vite listens on `0.0.0.0:5173` (code default) and proxies `/api` → FastAPI on `127.0.0.1:8000`.
 
 ### 6. On your laptop — SSH port-forward **only the UI**
 
 ```bash
 ssh -L 5173:127.0.0.1:5173 YOUR_USER@zgx-fury
 ```
-
-If you changed `ui_port` in config, use that port on both sides of `-L`.
 
 ### 7. Open the app on the laptop
 
@@ -229,13 +177,12 @@ On **Fury**, while the laptop UI is open:
 
 Same order as above, skip the SSH step, and open `http://127.0.0.1:5173` on that machine.
 
-For a quick laptop smoke test without models:
+For a quick smoke test without models (keyword guard only, no clinical RAG):
 
-```json
-"flags": { "offline_mode": true, "skip_clinical": true, "weight_cache": false }
+```bash
+export AEGIS_OFFLINE_MODE=1 AEGIS_SKIP_CLINICAL=1 AEGIS_WEIGHT_CACHE=0
+# then start API + UI only (steps 4–5)
 ```
-
-Then start API + UI only (steps 4–5).
 
 ---
 
@@ -256,7 +203,6 @@ Sample fixtures:
 
 - Tier latencies, PHI exposure, hot-patch rate
 - Host telemetry from `/proc`, `nvidia-smi`, and optional zrt metrics socket
-- Labels come from `platform.*` in `aegis.config.json`
 
 ---
 
@@ -317,7 +263,7 @@ aegis-ehr/
 
 ## Design principles
 
-- **Config, don’t hardcode** — paths/ports/labels in `aegis.config.json`
+- **Config, don’t hardcode** — zrt model paths in `aegis.config.json`; other defaults in code
 - **Measure, don’t invent** — dashboard numbers from recorded prompts, Chroma, `/proc`, `nvidia-smi`, optional zrt socket
 - **Fail closed** — classifier / Chroma unavailable blocks rather than retrieve
 - **PHI discipline** — scrub before cloud

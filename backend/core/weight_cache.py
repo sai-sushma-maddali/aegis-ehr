@@ -183,7 +183,7 @@ class RemoteEmbedder:
         return array
 
 
-def _spawn(model_path: str) -> None:
+def _spawn() -> None:
     import fcntl
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -201,8 +201,6 @@ def _spawn(model_path: str) -> None:
                 "-m",
                 "core.weight_cache",
                 "--serve",
-                "--model",
-                model_path,
             ],
             cwd=str(BACKEND_DIR),
             env=env,
@@ -213,9 +211,15 @@ def _spawn(model_path: str) -> None:
         PID_PATH.write_text(str(process.pid))
 
 
-def ensure_weight_cache(model_path: str, timeout: float = 240) -> None:
+def ensure_weight_cache(timeout: float = 240) -> None:
     """Connect to the resident cache, starting it once if it is not up."""
-    wanted = str(Path(model_path))
+    from .guard_loader import guard_identity
+
+    wanted = guard_identity()
+    if not wanted:
+        raise FileNotFoundError(
+            "No guard identity for weight cache (set qwen_base_model + peft)."
+        )
     health = fetch_health()
     if health and health.get("ready") and health.get("model_path") == wanted:
         logger.info("weight_cache.reused url=%s", cache_url())
@@ -224,7 +228,7 @@ def ensure_weight_cache(model_path: str, timeout: float = 240) -> None:
         raise RuntimeError(str(health["error"]))
     if health is None and not _pid_alive(_read_pid()):
         logger.info("weight_cache.starting url=%s", cache_url())
-        _spawn(wanted)
+        _spawn()
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -259,67 +263,31 @@ def _device() -> str:
 
 def _load_embedder() -> None:
     global _EMBEDDER
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     from sentence_transformers import SentenceTransformer
 
     logger.info("weight_cache.loading_embedder")
+    name = _embedding_model_name()
     try:
         _EMBEDDER = SentenceTransformer(
-            EMBEDDING_MODEL_NAME,
+            name,
             device=_device(),
-            local_files_only=True,
+            local_files_only=False,
         )
     except TypeError:
-        _EMBEDDER = SentenceTransformer(EMBEDDING_MODEL_NAME, device=_device())
+        _EMBEDDER = SentenceTransformer(name, device=_device())
     _STATE["embedder"] = True
 
 
-def _load_guard(model_path: str) -> None:
+def _load_guard() -> None:
     global _TOKENIZER, _GUARD
-    import torch
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    from .guard_loader import load_guard_classifier
 
-    merged = Path(model_path)
-    if not merged.exists():
-        raise FileNotFoundError(f"Guard weights not found at {merged}")
-
-    dtype = (
-        torch.bfloat16
-        if _device() == "cuda" and torch.cuda.is_bf16_supported()
-        else torch.float32
-    )
-    logger.info("weight_cache.loading_guard model=%s", merged)
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(merged),
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    try:
-        model = AutoModelForSequenceClassification.from_pretrained(
-            str(merged),
-            num_labels=2,
-            dtype=dtype,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-    except TypeError:
-        model = AutoModelForSequenceClassification.from_pretrained(
-            str(merged),
-            num_labels=2,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = tokenizer.pad_token_id
-    model.to(_device())
-    model.eval()
+    tokenizer, model, identity = load_guard_classifier(device=_device())
+    logger.info("weight_cache.loading_guard identity=%s", identity)
     _TOKENIZER = tokenizer
     _GUARD = model
     _STATE["guard"] = True
-    _STATE["model_path"] = str(merged)
+    _STATE["model_path"] = identity
 
 
 def _classify(text: str, max_length: int) -> dict[str, float | str]:
@@ -426,10 +394,10 @@ class _Handler(BaseHTTPRequestHandler):
         logger.info("weight_cache.http %s", fmt % args)
 
 
-def _load_all(model_path: str) -> None:
+def _load_all() -> None:
     try:
         _load_embedder()
-        _load_guard(model_path)
+        _load_guard()
         _STATE["ready"] = True
         logger.info("weight_cache.models_resident pid=%s", os.getpid())
     except Exception as exc:  # noqa: BLE001
@@ -439,7 +407,7 @@ def _load_all(model_path: str) -> None:
         os._exit(1)
 
 
-def serve(model_path: str) -> None:
+def serve() -> None:
     logging.basicConfig(
         level=os.getenv("AEGIS_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -450,7 +418,6 @@ def serve(model_path: str) -> None:
     server = ThreadingHTTPServer((host, cache_port()), _Handler)
     threading.Thread(
         target=_load_all,
-        args=(model_path,),
         name="weight-cache-load",
         daemon=True,
     ).start()
@@ -465,11 +432,15 @@ def serve(model_path: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aegis resident model cache")
     parser.add_argument("--serve", action="store_true")
-    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--model",
+        required=False,
+        help="Deprecated; guard weights are read from aegis.config.json",
+    )
     args = parser.parse_args()
     if not args.serve:
         parser.error("--serve is required")
-    serve(args.model)
+    serve()
 
 
 if __name__ == "__main__":
