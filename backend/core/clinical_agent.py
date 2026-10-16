@@ -691,6 +691,8 @@ class ClinicalAssistant:
         self.embedding_model_name = embedding_model_name
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.ollama_model = ollama_model
+        self._resolved_llm_model: str | None = None
+        self.last_usage: dict[str, Any] = {}
         self.raw_data_folder = Path(raw_data_folder)
         self.raw_data_folder.mkdir(parents=True, exist_ok=True)
         self.chroma_path.mkdir(parents=True, exist_ok=True)
@@ -749,18 +751,75 @@ class ClinicalAssistant:
         models = [
             model["id"]
             for model in response.json().get("data", [])
+            if isinstance(model, dict) and model.get("id")
         ]
         return models
+
+    @staticmethod
+    def _normalize_model_id(model_id: str) -> str:
+        """Strip zrt/HF prefixes so ids compare reliably."""
+        text = (model_id or "").strip()
+        if text.startswith("hf:"):
+            text = text[3:]
+        if "@" in text:
+            text = text.split("@", 1)[0]
+        return text.rstrip("/").lower()
+
+    def resolve_llm_model(self, *, force: bool = False) -> str:
+        """Pick the model id zrt actually advertises on ``/v1/models``.
+
+        Config may use ``hf:org/name@main`` while zrt lists ``org/name`` (or a
+        path). Sending the wrong id yields HTTP 404 on chat/completions.
+        """
+        if self._resolved_llm_model and not force:
+            return self._resolved_llm_model
+
+        configured = (self.ollama_model or "").strip()
+        try:
+            available = self.check_ollama()
+        except Exception:
+            available = []
+
+        if not available:
+            if configured:
+                self._resolved_llm_model = configured
+                return configured
+            raise RuntimeError(
+                f"No models listed at {self.ollama_base_url}/models. "
+                "Start zrt, e.g. "
+                "`zrt serve 'hf:mistralai/Mistral-7B-Instruct-v0.3@main'`."
+            )
+
+        wanted = self._normalize_model_id(configured)
+        chosen = available[0]
+        if wanted:
+            exact = None
+            fuzzy = None
+            mistral_hit = None
+            for model_id in available:
+                norm = self._normalize_model_id(model_id)
+                if norm == wanted or wanted.endswith(norm) or norm.endswith(wanted):
+                    exact = model_id
+                    break
+                if wanted in norm or norm in wanted:
+                    fuzzy = fuzzy or model_id
+                if "mistral" in wanted and "mistral" in norm:
+                    mistral_hit = mistral_hit or model_id
+            chosen = exact or fuzzy or mistral_hit or available[0]
+
+        self._resolved_llm_model = chosen
+        return chosen
 
     def generate_with_mistral(
         self,
         prompt: str,
         timeout: int = 120,
     ) -> str:
-        """Send a prompt to local Mistral-7B-Instruct-v0.3 through zrt."""
+        """Send a prompt to local Mistral through zrt's OpenAI-compatible API."""
         url = f"{self.ollama_base_url}/chat/completions"
+        model_id = self.resolve_llm_model()
         payload = {
-            "model": self.ollama_model,
+            "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
             "stream": False,
@@ -768,6 +827,11 @@ class ClinicalAssistant:
         started = time.perf_counter()
         try:
             response = requests.post(url, json=payload, timeout=timeout)
+            # Wrong model id → many OpenAI-compatible servers return 404.
+            if response.status_code == 404:
+                model_id = self.resolve_llm_model(force=True)
+                payload["model"] = model_id
+                response = requests.post(url, json=payload, timeout=timeout)
             response.raise_for_status()
             body = response.json()
             content = body["choices"][0]["message"]["content"].strip()
@@ -779,11 +843,29 @@ class ClinicalAssistant:
             }
             return content
         except Exception as error:
+            available = []
+            try:
+                available = self.check_ollama()
+            except Exception:
+                pass
+            detail = str(error)
+            if hasattr(error, "response") and error.response is not None:
+                try:
+                    detail = (
+                        f"{error.response.status_code} "
+                        f"{error.response.text[:300]}"
+                    )
+                except Exception:
+                    detail = str(error)
             raise RuntimeError(
-                "Local Mistral generation failed. "
-                "Make sure zrt is serving "
-                f"{self.ollama_model!r} "
-                "(e.g. `zrt serve hf:mistralai/Mistral-7B-Instruct-v0.3@main`)."
+                "Local Mistral generation failed at "
+                f"{url} (model={model_id!r}). "
+                f"Available models: {available or 'none'}. "
+                "On Fury run: "
+                "`zrt serve 'hf:mistralai/Mistral-7B-Instruct-v0.3@main' "
+                "--gpu-memory-fraction 0.30` "
+                "then `curl -s http://127.0.0.1:8080/v1/models`. "
+                f"Detail: {detail}"
             ) from error
 
     # ----- knowledge-base ingestion -----

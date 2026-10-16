@@ -120,6 +120,8 @@ Confirm (still on Fury):
 curl -s http://127.0.0.1:8080/v1/models
 ```
 
+You should see a JSON list with at least one model `id`. The API auto-picks that id for chat (config may say `hf:…@main` while zrt lists a shorter id). If this curl fails or returns empty, clinical chat will 404 until zrt is healthy.
+
 Clinical LLM URL defaults to `http://127.0.0.1:8080/v1` in code. Override with `AEGIS_CLINICAL_LLM_BASE_URL` only if zrt uses another port.
 
 ### 4. Start the FastAPI gateway on Fury

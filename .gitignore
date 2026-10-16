@@ -5,6 +5,7 @@ __pycache__/
 *.env
 venv/
 .venv/
+.venv-test/
 clinical_chroma_db/
 backend/data/chroma_ehr_db/
 backend/data/chroma_threat_db/
